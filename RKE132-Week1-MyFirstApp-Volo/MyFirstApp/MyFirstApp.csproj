@@ -1,10 +1,240 @@
-<Project Sdk="Microsoft.NET.Sdk">
+const bool DEBUG_DISTANCES = true;
+const bool DEBUG_ACTIONS   = true;
 
-  <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <TargetFramework>net6.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-  </PropertyGroup>
+const unsigned long START_DELAY_MS    = 3000;
+const unsigned long RUN_TIME_LIMIT_MS = 300000;   // 5 минут
+const unsigned long measureInterval   = 100;
 
-</Project>
+// Пины ультразвуков
+// TRIG: 13, 8, 9, 11, 12
+// ECHO: A0..A4
+const int trigPins[5] = {13, 8, 9, 11, 12};
+const int echoPins[5] = {A0, A1, A2, A3, A4};
+
+// Моторы (L298N)
+const int enA = 3;
+const int in1 = 2;
+const int in2 = 4;
+const int enB = 5;
+const int in3 = 6;
+const int in4 = 10;
+
+// Параметры движения
+const int speedForward = 160;
+const int speedSlow    = 120;
+const int speedTurn    = 170;
+
+// Параметры датчиков
+const unsigned long sensorTimeout = 30000;
+const int thresholdFront          = 20;
+const int minValidDistance        = 2;
+const int maxValidDistance        = 250;
+
+// Глобальные
+long distances[5] = {999, 999, 999, 999, 999};
+unsigned long lastMeasureTime = 0;
+unsigned long runStartTime    = 0;
+bool started                  = false;
+
+// 🔁 Направление "вперёд" — ИНВЕРТИРОВАНО (было HIGH/LOW)
+#define LEFT_FWD_A   LOW   // было HIGH
+#define LEFT_FWD_B   HIGH  // было LOW
+#define RIGHT_FWD_A  LOW   // было HIGH
+#define RIGHT_FWD_B  HIGH  // было LOW
+
+
+void setup() {
+  Serial.begin(9600);
+
+  // Настройка ультразвуковых датчиков
+  for (int i = 0; i < 5; i++) {
+    pinMode(trigPins[i], OUTPUT);
+    digitalWrite(trigPins[i], LOW);
+    pinMode(echoPins[i], INPUT);
+  }
+
+  // Моторы
+  pinMode(enA, OUTPUT);
+  pinMode(in1, OUTPUT);
+  pinMode(in2, OUTPUT);
+
+  pinMode(enB, OUTPUT);
+  pinMode(in3, OUTPUT);
+  pinMode(in4, OUTPUT);
+
+  moveStop();
+
+  Serial.println(F("==== ROBOTEX ROBOT (5 датчиков, 4 мотора) ===="));
+  Serial.println(F("Ожидание старта..."));
+}
+
+
+void loop() {
+  unsigned long now = millis();
+
+  // Стартовая задержка
+  if (!started) {
+    if (now >= START_DELAY_MS) {
+      started      = true;
+      runStartTime = now;
+      Serial.println(F(">>> СТАРТ! Робот начал движение."));
+    } else {
+      moveStop();
+      return;
+    }
+  }
+
+  // Ограничение по времени
+  if (now - runStartTime >= RUN_TIME_LIMIT_MS) {
+    moveStop();
+    Serial.println(F(">>> ВРЕМЯ ЗАЕЗДА ИСТЕКЛО. Робот остановлен."));
+    while (true) {
+      moveStop();
+    }
+  }
+
+  // Обновление датчиков по таймеру
+  if (now - lastMeasureTime >= measureInterval) {
+    lastMeasureTime = now;
+    measureAllSensors();
+    if (DEBUG_DISTANCES) {
+      printDistances();
+    }
+  }
+
+  // Логика движения
+  decisionLogic();
+}
+
+
+void decisionLogic() {
+  int front = distances[2];
+  int left  = min(distances[0], distances[1]);
+  int right = min(distances[3], distances[4]);
+
+  // 1) Очень близко спереди — разворот на месте
+  if (front < thresholdFront && front > 0) {
+    if (left > right) {
+      if (DEBUG_ACTIONS) Serial.println(F("Спереди близко. Поворачиваю влево."));
+      pivotLeft();
+    } else {
+      if (DEBUG_ACTIONS) Serial.println(F("Спереди близко. Поворачиваю вправо."));
+      pivotRight();
+    }
+    return;
+  }
+
+  // 2) Объект не очень далеко — едем медленнее
+  if (front < thresholdFront * 2 && front > 0) {
+    if (DEBUG_ACTIONS) Serial.println(F("Объект впереди, снижаю скорость."));
+    moveForwardSlow();
+    return;
+  }
+
+  // 3) Всё чисто — едем уверенно вперёд
+  if (DEBUG_ACTIONS) Serial.println(F("Путь свободен, еду вперёд."));
+  moveForward();
+}
+
+
+// --------- Движение ---------
+
+void moveForward() {
+  // Левый борт
+  digitalWrite(in1, LEFT_FWD_A);
+  digitalWrite(in2, LEFT_FWD_B);
+  analogWrite(enA, speedForward);
+
+  // Правый борт
+  digitalWrite(in3, RIGHT_FWD_A);
+  digitalWrite(in4, RIGHT_FWD_B);
+  analogWrite(enB, speedForward);
+}
+
+void moveForwardSlow() {
+  digitalWrite(in1, LEFT_FWD_A);
+  digitalWrite(in2, LEFT_FWD_B);
+  analogWrite(enA, speedSlow);
+
+  digitalWrite(in3, RIGHT_FWD_A);
+  digitalWrite(in4, RIGHT_FWD_B);
+  analogWrite(enB, speedSlow);
+}
+
+void moveStop() {
+  digitalWrite(in1, LOW);
+  digitalWrite(in2, LOW);
+  analogWrite(enA, 0);
+
+  digitalWrite(in3, LOW);
+  digitalWrite(in4, LOW);
+  analogWrite(enB, 0);
+}
+
+// Поворот на месте влево: левый назад, правый вперёд
+void pivotLeft() {
+  // левый назад (инверсия вперёд)
+  digitalWrite(in1, (LEFT_FWD_A == HIGH ? LOW : HIGH));
+  digitalWrite(in2, (LEFT_FWD_B == HIGH ? LOW : HIGH));
+  analogWrite(enA, speedTurn);
+
+  // правый вперёд
+  digitalWrite(in3, RIGHT_FWD_A);
+  digitalWrite(in4, RIGHT_FWD_B);
+  analogWrite(enB, speedTurn);
+}
+
+// Поворот на месте вправо: левый вперёд, правый назад
+void pivotRight() {
+  // левый вперёд
+  digitalWrite(in1, LEFT_FWD_A);
+  digitalWrite(in2, LEFT_FWD_B);
+  analogWrite(enA, speedTurn);
+
+  // правый назад (инверсия вперёд)
+  digitalWrite(in3, (RIGHT_FWD_A == HIGH ? LOW : HIGH));
+  digitalWrite(in4, (RIGHT_FWD_B == HIGH ? LOW : HIGH));
+  analogWrite(enB, speedTurn);
+}
+
+
+// --------- Датчики ---------
+
+void measureAllSensors() {
+  for (int i = 0; i < 5; i++) {
+    long d = measureDistance(trigPins[i], echoPins[i]);
+    if (d < minValidDistance || d > maxValidDistance) {
+      d = 999;
+    }
+    distances[i] = d;
+  }
+}
+
+long measureDistance(int trigPin, int echoPin) {
+  long duration;
+
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  duration = pulseIn(echoPin, HIGH, sensorTimeout);
+  if (duration == 0) return 999;
+
+  long cm = duration * 0.034 / 2;
+  return cm;
+}
+
+
+// --------- Отладка ---------
+
+void printDistances() {
+  Serial.print(F("D: "));
+  for (int i = 0; i < 5; i++) {
+    Serial.print(distances[i]);
+    if (i < 4) Serial.print(F(", "));
+  }
+  Serial.println(F(" см"));
+}
